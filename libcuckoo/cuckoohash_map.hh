@@ -201,18 +201,22 @@ private:
                                            RealPartialContainer>::type {
     private:
         std::array<typename std::aligned_storage<
-                       sizeof(key_type), alignof(key_type)>::type,
-                   SLOT_PER_BUCKET> keys_;
-        std::array<typename std::aligned_storage<
-                       sizeof(mapped_type), alignof(mapped_type)>::type,
-                   SLOT_PER_BUCKET> vals_;
+                       sizeof(value_type), alignof(value_type)>::type,
+                   SLOT_PER_BUCKET> kvpairs_;
         std::bitset<SLOT_PER_BUCKET> occupied_;
 
-        // key_allocator is the allocator used to construct keys
-        static std::allocator<key_type> key_allocator;
+        // kvpair_allocator is the allocator to construct key-value pairs
+        static std::allocator<value_type> kvpair_allocator;
 
-        // value_allocator is the allocator to construct values
-        static std::allocator<mapped_type> value_allocator;
+        const value_type& kvpair(int ind) const {
+            return *static_cast<const value_type*>(
+                static_cast<const void*>(&kvpairs_[ind]));
+        }
+
+        value_type& kvpair_noconst(int ind) {
+            return *static_cast<value_type*>(
+                static_cast<void*>(&kvpairs_[ind]));
+        }
 
     public:
         bool occupied(int ind) const {
@@ -220,34 +224,31 @@ private:
         }
 
         const key_type& key(int ind) const {
-            return *static_cast<const key_type*>(
-                static_cast<const void*>(&keys_[ind]));
+            return kvpair(ind).first;
         }
 
         key_type& key(int ind) {
-            return *static_cast<key_type*>(static_cast<void*>(&keys_[ind]));
+            return kvpair_noconst(ind).first;
         }
 
         const mapped_type& val(int ind) const {
-            return *static_cast<const mapped_type*>(
-                static_cast<const void*>(&vals_[ind]));
+            return kvpair(ind).second;
         }
 
         mapped_type& val(int ind) {
-            return *static_cast<mapped_type*>(static_cast<void*>(&vals_[ind]));
+            return kvpair_noconst(ind).second;
         }
 
-        template <class V>
-        void setKV(size_t ind, const key_type& k, V v) {
+        template <class... Args>
+        void setKV(size_t ind, Args&&... args) {
             occupied_.set(ind);
-            key_allocator.construct(&key(ind), k);
-            value_allocator.construct(&val(ind), std::forward<V>(v));
+            kvpair_allocator.construct(
+                &kvpair(ind), std::forward<Args>(args)...);
         }
 
         void eraseKV(size_t ind) {
             occupied_.reset(ind);
-            key_allocator.destroy(&key(ind));
-            value_allocator.destroy(&val(ind));
+            kvpair_allocator.destroy(&kvpair_noconst(ind));
         }
 
         Bucket() {
@@ -2073,6 +2074,11 @@ public:
 };
 
 // Initializing the static members
+
+template <class Key, class T, class Hash, class Pred>
+std::allocator<typename cuckoohash_map<Key, T, Hash, Pred>::value_type>
+cuckoohash_map<Key, T, Hash, Pred>::Bucket::kvpair_allocator;
+
 template <class Key, class T, class Hash, class Pred>
     __thread typename cuckoohash_map<Key, T, Hash, Pred>::TableInfo**
     cuckoohash_map<Key, T, Hash, Pred>::hazard_pointer = nullptr;
