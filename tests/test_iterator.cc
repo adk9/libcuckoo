@@ -33,45 +33,36 @@ public:
             std::numeric_limits<ValType>::max());
         std::mt19937_64 gen(seed);
         for (size_t i = 0; i < size; i++) {
-            items[i].first = i;
-            items[i].second = v_dist(gen);
-            EXPECT_TRUE(table.insert(items[i].first, items[i].second));
+            items[i] = v_dist(gen);
+            EXPECT_TRUE(table.insert(i, items[i]));
         }
     }
 
     Table emptytable;
     Table table;
-    std::pair<KeyType, ValType> items[size];
-    std::pair<KeyType, ValType>* items_end;
+    ValType items[size];
+    ValType* items_end;
 };
 
 IteratorEnvironment* iter_env;
 
 void EmptyTableBeginEndIterator() {
     Table emptytable(size);
-    Table::const_iterator t = iter_env->emptytable.cbegin();
-    ASSERT_TRUE(t.is_begin() && t.is_end());
-    t.release();
-    t = iter_env->emptytable.cend();
-    ASSERT_TRUE(t.is_begin() && t.is_end());
-}
-
-bool check_table_snapshot() {
-    std::vector<Table::value_type> snapshot_items =
-        iter_env->table.snapshot_table();
-    for (size_t i = 0; i < snapshot_items.size(); i++) {
-        if (std::find(iter_env->items, iter_env->items_end, snapshot_items[i])
-            == iter_env->items_end) {
-            return false;
-        }
-    }
-    return true;
+    Table::locked_table lt = emptytable.lock_table();
+    Table::locked_table::const_iterator it = lt.cbegin();
+    ASSERT_TRUE(it == lt.cend());
+    lt.release();
+    lt = emptytable.lock_table();
+    it = lt.cend();
+    ASSERT_TRUE(it == lt.cbegin());
 }
 
 void FilledTableIterForwards() {
     bool visited[size] = {};
-    for (auto t = iter_env->table.cbegin(); !t.is_end(); ++t) {
-        auto itemiter = std::find(iter_env->items, iter_env->items_end, *t);
+    auto lt = iter_env->table.lock_table();
+    for (const auto& item : lt) {
+        auto itemiter = std::find(iter_env->items, iter_env->items_end,
+                                  item.second);
         EXPECT_NE(itemiter, iter_env->items_end);
         visited[iter_env->items_end-itemiter-1] = true;
     }
@@ -79,35 +70,36 @@ void FilledTableIterForwards() {
     for (size_t i = 0; i < size; i++) {
         EXPECT_TRUE(visited[i]);
     }
-    EXPECT_TRUE(check_table_snapshot());
 }
 
 void FilledTableIterBackwards() {
-    Table::const_iterator t = iter_env->table.cend();
+    auto lt = iter_env->table.lock_table();
+    auto it = lt.cend();
     bool visited[size] = {};
     do {
-        t--;
-        auto itemiter = std::find(iter_env->items, iter_env->items_end, *t);
+        it--;
+        auto beg = lt.cbegin();
+        auto itemiter = std::find(iter_env->items, iter_env->items_end,
+                                  it->second);
         EXPECT_NE(itemiter, iter_env->items_end);
         visited[iter_env->items_end-itemiter-1] = true;
-    } while (!t.is_begin());
+    } while (it != lt.cbegin());
     // Checks that all the items were visited
     for (size_t i = 0; i < size; i++) {
         EXPECT_TRUE(visited[i]);
     }
-    t.release();
-    EXPECT_TRUE(check_table_snapshot());
 }
 
 void FilledTableIncrementItems() {
     for (size_t i = 0; i < size; i++) {
-        iter_env->items[i].second++;
+        iter_env->items[i]++;
     }
     // Also tests casting from a const iterator to a mutable one
-    for (auto t_mut = static_cast<Table::iterator>(iter_env->table.cbegin());
-           !t_mut.is_end(); ++t_mut) {
-        t_mut.set_value(t_mut->second+1);
-        EXPECT_NE(std::find(iter_env->items, iter_env->items_end, *t_mut),
+    auto lt = iter_env->table.lock_table();
+    for (auto t_mut = lt.begin(); t_mut != lt.end(); ++t_mut) {
+        t_mut->second++;
+        EXPECT_NE(std::find(iter_env->items, iter_env->items_end,
+                            t_mut->second),
                   iter_env->items_end);
     }
 }
