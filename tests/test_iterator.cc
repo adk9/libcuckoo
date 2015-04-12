@@ -94,14 +94,47 @@ void FilledTableIncrementItems() {
     for (size_t i = 0; i < size; i++) {
         iter_env->items[i]++;
     }
-    // Also tests casting from a const iterator to a mutable one
     auto lt = iter_env->table.lock_table();
-    for (auto t_mut = lt.begin(); t_mut != lt.end(); ++t_mut) {
-        t_mut->second++;
-        EXPECT_NE(std::find(iter_env->items, iter_env->items_end,
-                            t_mut->second),
+    std::for_each(lt.begin(), lt.end(), [](Table::value_type& item) {
+            item.second++;
+        });
+    for (const auto& item : lt) {
+        EXPECT_NE(std::find(iter_env->items, iter_env->items_end, item.second),
                   iter_env->items_end);
     }
+}
+
+void LockedTableOwnership() {
+    // locked_tables should have the lock
+    auto lt = iter_env->table.lock_table();
+    auto empty_lt = iter_env->emptytable.lock_table();
+    EXPECT_TRUE(lt.has_lock());
+    EXPECT_TRUE(empty_lt.has_lock());
+
+    // iterators should be valid
+    auto ltit = lt.cbegin();
+    auto emptyltit = empty_lt.cbegin();
+    EXPECT_TRUE(ltit.is_valid());
+    EXPECT_TRUE(emptyltit.is_valid());
+
+    // swapping table data and iterators should keep everything valid
+    lt.swap(empty_lt);
+    std::swap(ltit, emptyltit);
+    EXPECT_TRUE(lt.has_lock());
+    EXPECT_TRUE(empty_lt.has_lock());
+    EXPECT_TRUE(ltit.is_valid());
+    EXPECT_TRUE(emptyltit.is_valid());
+
+    // swap everything back to avoid confusion
+    empty_lt.swap(lt);
+    std::swap(emptyltit, ltit);
+
+    // Move assignment should destroy the locked_table being assigned to and all
+    // its iterators should be invalid
+    lt = std::move(empty_lt);
+    EXPECT_FALSE(empty_lt.has_lock());
+    EXPECT_FALSE(ltit.is_valid());
+    EXPECT_TRUE(emptyltit.is_valid());
 }
 
 int main() {
@@ -114,5 +147,7 @@ int main() {
     FilledTableIterForwards();
     std::cout << "Running FilledTableIncrementItems" << std::endl;
     FilledTableIncrementItems();
+    std::cout << "Running LockedTableOwnership" << std::endl;
+    LockedTableOwnership();
     return main_return_value;
 }

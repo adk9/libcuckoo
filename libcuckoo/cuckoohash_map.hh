@@ -1665,19 +1665,24 @@ private:
     }
 
 public:
-    //! A locked table provides a set of operations on the table that aren't
-    //! possible in a concurrent context. Right now, this includes the ability
-    //! to construct iterators on the table. Creating a locked_table will take
-    //! all the locks on the table, and will release them when destroyed (or the
-    //! \p release method is called).
+    //! A locked_table is an ownership wrapper around a \ref cuckoohash_map
+    //! table instance. When given a table instance, it takes all the locks on
+    //! the table, blocking all outside operations on the table. Because the
+    //! locked_table has unique ownership of the table, it can provide a set of
+    //! operations on the table that aren't possible in a concurrent context.
+    //! Right now, this includes the ability to construct STL-compatible
+    //! iterators on the table. When the locked_table is destroyed (or the \ref
+    //! release method is called), it will release all locks on the table. This
+    //! will invalidate all existing iterators.
     class locked_table {
         typedef cuckoohash_map<Key, T, Hash, Pred> hashtable_t;
         // The table info of the hash map being locked
         hashtable_t::TableInfo* ti_;
-        // Whether the table has the locks on hm_ or not. This is shared to all
-        // iterators that are created, and is destroyed when all the iterators
-        // are destroyed.
-        std::shared_ptr<bool> has_table_lock_;
+        // Whether the table has the locks on hm_ or not. This pointer is shared
+        // to all iterators that are created, and is destroyed only when all the
+        // iterators are destroyed. If the shared_ptr doesn't have an associated
+        // pointer or is false, then the locked_table doesn't own the lock.
+        std::shared_ptr<bool> has_lock_;
 
         // The constructor locks the entire table, retrying until
         // snapshot_and_lock_all succeeds. We keep this constructor private (but
@@ -1687,23 +1692,22 @@ public:
             hashtable_t::check_hazard_pointer();
             ti_ = hm.snapshot_and_lock_all();
             assert(ti_ == hm.table_info.load());
-            has_table_lock_ = std::make_shared<bool>(true);
+            has_lock_ = std::make_shared<bool>(true);
         }
 
     public:
-        //! Delete the default constructor, which should never be used
-        locked_table() = delete;
-        //! Delete the copy constructor, which should never be used
-        locked_table(const locked_table& lt) = delete;
+        //! The default constructor will construct a locked table with no
+        //! associated table or table lock
+        locked_table() {
+            ti_ = nullptr;
+            has_lock_.reset();
+        }
 
-        //! This is an rvalue-reference constructor that takes the locks from \p
-        //! lt.
-        locked_table(locked_table&& lt) : ti_(lt.ti_) {
-            if (this == &lt) {
-                return;
-            }
-            has_table_lock_ = std::make_shared<bool>(*(lt.has_table_lock_));
-            lt.release();
+        //! This is an rvalue-reference constructor that takes ownership of the
+        //! table from \p lt
+        locked_table(locked_table&& lt) {
+            ti_ = lt.ti_;
+            has_lock_ = std::move(lt.has_lock_);
         }
 
         //! This is an rvalue-reference assignment operator
@@ -1711,26 +1715,36 @@ public:
             if (this == &lt) {
                 return *this;
             }
-            ti_ = lt.ti_;
-            has_table_lock_ = std::make_shared<bool>(*(lt.has_table_lock_));
+            // Swap this data with the given table
+            swap(lt);
+            // Release the resources of lt, which now contains our original data
             lt.release();
             return *this;
         }
 
         //! Returns true if the locked table still has a table lock, false
         //! otherwise
-        bool has_table_lock() {
-            return *has_table_lock_;
+        bool has_lock() {
+            return has_lock_ && *has_lock_;
+        }
+
+        //! swap will exchange the state of this locked_table with the given one
+        void swap(locked_table& lt) {
+            std::swap(ti_, lt.ti_);
+            has_lock_.swap(lt.has_lock_);
         }
 
         //! release unlocks the table, thereby freeing it up for other
         //! operations, but also invalidating all iterators and future
         //! operations with this table.
         void release() {
-            if (*has_table_lock_) {
+            if (has_lock()) {
                 AllUnlocker au(ti_);
                 hashtable_t::HazardPointerUnsetter hpu;
-                *has_table_lock_ = false;
+                // We invalidate all iterators by setting the pointer value to
+                // false. Then we reset it to remove the table's reference.
+                *has_lock_ = false;
+                has_lock_.reset();
             }
         }
 
@@ -1745,23 +1759,31 @@ public:
             public std::iterator<std::bidirectional_iterator_tag,
                                  hashtable_t::value_type> {
         public:
-            const_iterator(): parent_has_table_lock_(nullptr),
+            const_iterator(): parent_has_lock_(nullptr),
                               parent_ti_(nullptr) {}
 
             const_iterator(const const_iterator& it):
-                parent_has_table_lock_(it.parent_has_table_lock_),
+                parent_has_lock_(it.parent_has_lock_),
                 parent_ti_(it.parent_ti_),
                 index_(it.index_), slot_(it.slot_) {}
 
             const_iterator& operator=(const const_iterator& it) {
-                parent_has_table_lock_ = it.parent_has_table_lock_;
+                parent_has_lock_ = it.parent_has_lock_;
                 parent_ti_ = it.parent_ti_;
                 index_ = it.index_;
                 slot_ = it.slot_;
                 return *this;
             }
 
+            //! is_valid returns true if the iterator is still valid. An
+            //! iterator is invalid if it has no parent lock or when the
+            //! locked_table object that spawned it is destroyed.
+            bool is_valid() const {
+                return parent_has_lock_ && *parent_has_lock_;
+            }
+
             bool operator==(const const_iterator& it) const {
+                check_table();
                 if (parent_ti_ == nullptr || it.parent_ti_ == nullptr) {
                     return false;
                 }
@@ -1770,6 +1792,7 @@ public:
             }
 
             bool operator!=(const const_iterator& it) const {
+                check_table();
                 if (parent_ti_ == nullptr || it.parent_ti_ == nullptr) {
                     return false;
                 }
@@ -1837,7 +1860,7 @@ public:
         protected:
             // Indicates whether the locked_table that generated the iterator
             // has the table lock
-            std::shared_ptr<bool> parent_has_table_lock_;
+            std::shared_ptr<bool> parent_has_lock_;
             // The table info owned by the parent locked table. If this is null,
             // then the iterator is in an invalid state, and all table-related
             // operations will fail.
@@ -1851,10 +1874,10 @@ public:
 
             // The private constructor is used by locked_table to create
             // iterators from scratch
-            const_iterator(std::shared_ptr<bool> parent_has_table_lock,
+            const_iterator(std::shared_ptr<bool> parent_has_lock,
                            hashtable_t::TableInfo* parent_ti,
                            size_t index, size_t slot):
-                parent_has_table_lock_(parent_has_table_lock),
+                parent_has_lock_(parent_has_lock),
                 parent_ti_(parent_ti), index_(index), slot_(slot) {
                 check_table();
                 // Moves forward until we reach the end of the bucket or an
@@ -1872,12 +1895,8 @@ public:
             // Checks the iterator to make sure any table-involving operation is
             // okay
             void check_table() const {
-                if (parent_ti_ == nullptr) {
-                    throw std::runtime_error("Cannot operate on invalid table");
-                } else if (!(*parent_has_table_lock_)) {
-                    throw std::runtime_error(
-                        "Cannot operate on locked_table that doesn't"
-                        " have the table lock");
+                if (!is_valid()) {
+                    throw std::runtime_error("Iterator is invalid");
                 }
             }
 
@@ -1914,12 +1933,12 @@ public:
     public:
         //! begin returns an iterator to the beginning of the table
         iterator begin() {
-            return iterator(has_table_lock_, ti_, 0, 0);
+            return iterator(has_lock_, ti_, 0, 0);
         }
 
         //! begin returns a const_iterator to the beginning of the table
         const_iterator begin() const {
-            return const_iterator(has_table_lock_, ti_, 0, 0);
+            return const_iterator(has_lock_, ti_, 0, 0);
         }
 
         //! cbegin returns a const_iterator to the beginning of the table
@@ -1929,14 +1948,12 @@ public:
 
         //! end returns an iterator to the end of the table
         iterator end() {
-            return iterator(has_table_lock_, ti_,
-                            ti_->buckets_.size(), 0);
+            return iterator(has_lock_, ti_, ti_->buckets_.size(), 0);
         }
 
         //! end returns a const_iterator to the end of the table
         const_iterator end() const {
-            return const_iterator(has_table_lock_, ti_,
-                                  ti_->buckets_.size(), 0);
+            return const_iterator(has_lock_, ti_, ti_->buckets_.size(), 0);
         }
 
         //! cend returns a const_iterator to the end of the table
@@ -1945,8 +1962,8 @@ public:
         }
     };
 
-    //! lock_table will take all the locks in the table and return a \p
-    //! locked_table object, which can be used to iterate through the table
+    //! lock_table construct a \ref locked_table object that owns all the locks
+    //! in the table. This can be used to iterate through the table.
     locked_table lock_table() {
         return locked_table(*this);
     }
